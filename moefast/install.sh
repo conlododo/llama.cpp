@@ -17,10 +17,20 @@ command -v cmake >/dev/null || die "cmake not found (need >= 3.24)"
 cmake_ver="$(cmake --version | head -1 | awk '{print $3}')"
 say "cmake $cmake_ver"
 
-if command -v nvcc >/dev/null; then
-  say "nvcc: $(nvcc --version | tail -1)"
+# locate nvcc (PATH, /usr/local/cuda, /usr/local/cuda-*)
+NVCC="$(command -v nvcc || true)"
+if [ -z "$NVCC" ]; then
+  for c in /usr/local/cuda/bin/nvcc /usr/local/cuda-*/bin/nvcc; do
+    [ -x "$c" ] && { NVCC="$c"; break; }
+  done
+fi
+if [ -n "$NVCC" ]; then
+  export CUDACXX="$NVCC"
+  export PATH="$(dirname "$NVCC"):$PATH"
+  say "nvcc: $($NVCC --version | tail -1)"
 else
-  say "WARNING: nvcc not found in PATH — a CPU-only build will be produced (slow, test only)"
+  say "ERROR: nvcc not found (PATH or /usr/local/cuda*/bin) — install the CUDA toolkit, or build CPU-only by hand"
+  exit 1
 fi
 
 [ -f "$ROOT/CMakeLists.txt" ] || die "run this from inside the llama.cpp fork"
