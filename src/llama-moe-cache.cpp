@@ -1,5 +1,9 @@
 #include "llama-moe-cache.h"
 
+#include <fstream>
+#include <algorithm>
+#include <cstring>
+
 #include "llama-impl.h"
 #include "llama-model.h"
 
@@ -511,6 +515,74 @@ struct llama_moe_cache::impl {
         return it != bindings.end() ? it->second.cached : nullptr;
     }
 
+    // 热度表播种：按热度把 (layer, expert) 预置到各 group 的槽位并上传
+    void seed_from_heat(const char * path) {
+        std::ifstream f(path, std::ios::binary);
+        if (!f) { LLAMA_LOG_WARN("moe-cache seed: cannot open %s\n", path); return; }
+        char magic[8] = {0};
+        f.read(magic, 8);
+        if (std::memcmp(magic, "MOEHEAT1", 8) != 0) { LLAMA_LOG_WARN("moe-cache seed: bad magic\n"); return; }
+        uint32_t n_layer = 0, n_expert = 0;
+        f.read((char *) &n_layer, 4);
+        f.read((char *) &n_expert, 4);
+        std::vector<uint64_t> ebytes(n_layer);
+        f.read((char *) ebytes.data(), (std::streamsize)(n_layer * sizeof(uint64_t)));
+        std::vector<uint32_t> counts((size_t) n_layer * n_expert);
+        f.read((char *) counts.data(), (std::streamsize)(counts.size() * sizeof(uint32_t)));
+
+        int64_t seeded = 0;
+        for (auto & g : groups) {
+            if (g.n_slots <= 0 || !g.slru.slot_map.size()) continue;
+            // fit / dry-run：权重未加载，跳过播种
+            bool have_data = true;
+            for (int32_t il : g.layers) {
+                if (il < 0 || (size_t) il >= layers.size()) continue;
+                for (const auto * w : layers[(size_t) il].experts) {
+                    if (!w || !w->data) { have_data = false; break; }
+                }
+                if (!have_data) break;
+            }
+            if (!have_data) continue;
+            auto & sl = g.slru;
+            const int32_t ne = sl.n_expert;
+
+            struct cand { uint32_t c; int32_t il, e; };
+            std::vector<cand> cands;
+            for (int32_t il : g.layers) {
+                if (il < 0 || il >= (int32_t) n_layer) continue;
+                for (int32_t e = 0; e < ne && e < (int32_t) n_expert; ++e) {
+                    const uint32_t c = counts[(size_t) il * n_expert + (size_t) e];
+                    if (c) cands.push_back({c, il, e});
+                }
+            }
+            std::sort(cands.begin(), cands.end(), [](const cand & a, const cand & b){ return a.c > b.c; });
+
+            const int32_t take = std::min<int32_t>(g.n_slots, (int32_t) cands.size());
+            for (int32_t i = 0; i < take; ++i) {
+                const int32_t il = cands[(size_t) i].il;
+                const int32_t e  = cands[(size_t) i].e;
+                const int32_t slot = i;
+                sl.slot_map[(size_t) il][(size_t) e] = slot;
+                sl.key_of[(size_t) slot] = il * ne + e;
+                sl.move(slot, /*protect=*/true);   // 作为最近使用，先受保护
+
+                // 上传数据到 bank
+                const layer & l = layers[(size_t) il];
+                ggml_backend_t be = devices[(size_t) g.id].backend;
+                for (size_t ip = 0; ip < l.experts.size() && ip < g.banks.size(); ++ip) {
+                    const ggml_tensor * w = l.experts[ip];
+                    ggml_tensor * bank = g.banks[ip];
+                    const size_t esz = w->nb[2];
+                    ggml_backend_tensor_set_async(be, bank, (const uint8_t *) w->data + (size_t) e * esz,
+                                                  (size_t) slot * esz, esz);
+                }
+                ggml_backend_synchronize(devices[(size_t) g.id].backend);
+                ++seeded;
+            }
+        }
+        LLAMA_LOG_INFO("moe-cache seed: %s -> %lld experts preloaded\n", path, (long long) seeded);
+    }
+
     int64_t copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last) {
         const auto it = bindings.find(w);
         if (it == bindings.end()) {
@@ -649,6 +721,10 @@ ggml_tensor * llama_moe_cache::get_slot_map(int32_t il, int64_t n_tokens, int64_
 
 ggml_tensor * llama_moe_cache::get_experts(const ggml_tensor * w) const {
     return pimpl->get_experts(w);
+}
+
+void llama_moe_cache::seed_from_heat(const char * path) {
+    pimpl->seed_from_heat(path);
 }
 
 bool llama_moe_cache::copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph) {
