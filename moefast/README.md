@@ -1,5 +1,32 @@
 # moefast-35B
 
+**Benchmark — first-token latency (TTFT) on a single 16 GB GPU, MTP enabled in all three stacks**
+
+Hardware: **RTX 5060 Ti 16 GB** (driver 580.126.20, CUDA 13.0) · **AMD Ryzen 9 9900X** (24 threads) ·
+**30 GB RAM** · Ubuntu 24.04 (kernel 7.0.0-38). Model: our fine-tuned merge of
+**Qwen3.6-35B-A3B UD-Q4_K_XL** (753 tensors, MTP block included, 22.85 GB).
+
+Measurement: streaming request, greedy, `max_tokens=32`, fresh prompt per run (no prompt-cache
+reuse), 3 runs per size, **median TTFT** (time until the first streamed token).
+
+| Stack | Config (all with MTP) | TTFT ~50 tok | TTFT ~1K tok | TTFT ~4K tok |
+|---|---|---:|---:|---:|
+| **moefast (this fork)** | `-ngl 99 -ot exps=CPU -c 8192 -b 2048 -ub 2048 --moe-cache-mib auto` + heat pre-seed + `--spec-type draft-mtp --spec-draft-n-max 3` | **0.266 s** | **0.595 s** | **1.275 s** |
+| **llama.cpp (vanilla, our patches off)** | same, but `--moe-cache-mib 0` (no expert cache, no heat) | 0.562 s | 0.962 s | 1.942 s |
+| **Strata (v0.1.45, 16 GB instance)** | `serve/server.py`, `--max-context 8192 --prefill auto --mtp 2`, greedy sampling, same GGUF | **0.191 s** | 0.717 s | 1.417 s |
+
+| | small | medium | large |
+|---|---:|---:|---:|
+| moefast vs vanilla llama.cpp | **2.1× faster** | **1.6× faster** | **1.5× faster** |
+| moefast vs Strata | 1.4× slower | **1.2× faster** | **1.1× faster** |
+
+Reading the table: Strata wins the tiny-prompt case (its engine prefill path has less fixed overhead),
+while the MoE expert cache pays off as the prompt grows — moefast is the fastest from ~1K tokens up,
+which is where real agent / document workloads live. Vanilla llama.cpp (experts on CPU, no cache) is
+the slowest in every size.
+
+---
+
 A small set of patches on top of [llama.cpp](https://github.com/ggml-org/llama.cpp) that make a
 30B-class MoE model (Qwen3.6-35B-A3B, `qwen35moe`) run fast on a **single 16 GB consumer GPU**.
 
