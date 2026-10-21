@@ -548,6 +548,14 @@ llama_context::llama_context(
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
         }
 
+        // 显式覆盖：LLAMA_MOE_CACHE_MIB=N（MiB），优先级高于 auto
+        if (const char * env_mib = getenv("LLAMA_MOE_CACHE_MIB")) {
+            const long long mib = atoll(env_mib);
+            if (mib > 0) {
+                cparams.moe_cache_size = (size_t) mib * 1024 * 1024;
+                LLAMA_LOG_INFO("%s: moe-cache size overridden by LLAMA_MOE_CACHE_MIB = %lld MiB\n", __func__, mib);
+            }
+        }
         if (cparams.moe_cache_size == (size_t) -1) {   // auto：按当前实测剩余显存
             size_t vfree = 0, vtotal = 0;
             for (auto * be : backend_ptrs) {
@@ -557,11 +565,19 @@ llama_context::llama_context(
                     break;
                 }
             }
-            // 预留：至少 700MiB，或 15% 的空闲（给 MTP 草稿上下文/计算缓冲留余地）
-            const size_t reserve = std::max<size_t>(700ull * 1024 * 1024, (size_t)(vfree * 15 / 100));
+            // 预留：至少 700MiB 或 15% 的空闲；可用 LLAMA_MOE_CACHE_RESERVE_MIB 显式指定
+            // （给桌面/浏览器/视频解码留显存，例如 2048 = 留 2 GiB）
+            size_t reserve = std::max<size_t>(700ull * 1024 * 1024, (size_t)(vfree * 15 / 100));
+            if (const char * env_reserve = getenv("LLAMA_MOE_CACHE_RESERVE_MIB")) {
+                const long long mib = atoll(env_reserve);
+                if (mib > 0) {
+                    reserve = std::max<size_t>(reserve, (size_t) mib * 1024 * 1024);
+                }
+            }
             cparams.moe_cache_size = vfree > reserve ? (vfree - reserve) : 0;
-            LLAMA_LOG_INFO("%s: moe-cache auto size = %.2f GiB (free=%.2f GiB)\n",
-                           __func__, (double) cparams.moe_cache_size / (1 << 30), (double) vfree / (1 << 30));
+            LLAMA_LOG_INFO("%s: moe-cache auto size = %.2f GiB (free=%.2f GiB, reserve=%.2f GiB)\n",
+                           __func__, (double) cparams.moe_cache_size / (1 << 30), (double) vfree / (1 << 30),
+                           (double) reserve / (1 << 30));
         }
         if (cparams.moe_cache_size > 0) {
             moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs, backend_buft, cparams.moe_cache_size);
